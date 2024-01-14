@@ -58,7 +58,6 @@ fn main() {
     ) {
         Ok(val) => Some(val),
         Err(why) => {
-            // Error only if "no_panic_on_missing_launch_options" is not true.
             tracing::warn!("Couldn't verify app launch options {:?}, ignoring...", why);
             None
         }
