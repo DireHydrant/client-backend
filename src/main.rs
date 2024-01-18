@@ -8,10 +8,14 @@ use server::Server;
 use steamapi::SteamAPIManager;
 use steamid_ng::SteamID;
 use tokio::select;
-use tokio::sync::mpsc::unbounded_channel;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+use tokio::task::JoinHandle;
 use web::{web_main, SharedState};
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::{self, Pin};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -39,6 +43,172 @@ mod steamapi;
 mod web;
 
 static UI_DIR: Dir = include_dir!("ui");
+
+struct State {}
+
+struct Executor {
+    pub sources: Vec<Box<dyn MessageSource>>,
+    pub handlers: Vec<Box<dyn Handler>>,
+    pub queue: Vec<Message>,
+    pub async_tasks: Vec<JoinHandle<FutureResponse>>,
+}
+
+impl Executor {
+    pub async fn execute_cycle(&mut self, state: &mut State) {
+        let mut messages = Vec::new();
+
+        // Check sources
+        messages.append(&mut self.queue);
+        for s in &mut self.sources {
+            while let Some(m) = s.next_message() {
+                messages.push(m);
+            }
+        }
+
+        // Check async tasks
+        let mut finished_tasks = Vec::new();
+        for (i, j) in self.async_tasks.iter_mut().enumerate() {
+            if j.is_finished() {
+                finished_tasks.push(i);
+                match j.await.unwrap() {
+                    FutureResponse::Single(m) => messages.push(m),
+                    FutureResponse::Multi(m) => messages.extend(m),
+                }
+            }
+        }
+        for i in finished_tasks.into_iter().rev() {
+            self.async_tasks.remove(i);
+        }
+
+        // Run handlers
+        for h in &mut self.handlers {
+            for m in &messages {
+                match h.handle_message(state, m) {
+                    HandlerResponse::SingleMessage(new_m) => self.queue.push(new_m),
+                    HandlerResponse::MultiMessage(new_m) => self.queue.extend(new_m),
+                    HandlerResponse::Future(f) => {
+                        self.async_tasks.push(tokio::task::spawn(f));
+                    }
+                }
+            }
+        }
+
+        // Update state
+        for m in messages {
+            m.update_state(state);
+        }
+    }
+}
+
+enum HandlerResponse {
+    SingleMessage(Message),
+    MultiMessage(Vec<Message>),
+    Future(Pin<Box<dyn Future<Output = FutureResponse> + Send>>),
+}
+
+enum FutureResponse {
+    Single(Message),
+    Multi(Vec<Message>),
+}
+
+impl From<Message> for HandlerResponse {
+    fn from(value: Message) -> Self {
+        HandlerResponse::SingleMessage(value)
+    }
+}
+
+impl From<Vec<Message>> for HandlerResponse {
+    fn from(value: Vec<Message>) -> Self {
+        HandlerResponse::MultiMessage(value)
+    }
+}
+
+impl From<Pin<Box<dyn Future<Output = FutureResponse> + Send>>> for HandlerResponse {
+    fn from(value: Pin<Box<dyn Future<Output = FutureResponse> + Send>>) -> Self {
+        HandlerResponse::Future(value)
+    }
+}
+
+trait Handler {
+    fn handle_message(&mut self, state: &State, message: &Message) -> HandlerResponse;
+}
+
+enum Message {
+    Refresh,
+    Update(Update),
+    NewPlayer(NewPlayer),
+}
+
+trait MessageSource {
+    fn next_message(&mut self) -> Option<Message>;
+}
+
+impl<M: Into<Message>> MessageSource for UnboundedReceiver<M> {
+    fn next_message(&mut self) -> Option<Message> {
+        match self.try_recv() {
+            Ok(m) => Some(m.into()),
+            _ => None,
+        }
+    }
+}
+
+impl<M: Into<Message>> MessageSource for Receiver<M> {
+    fn next_message(&mut self) -> Option<Message> {
+        match self.try_recv() {
+            Ok(m) => Some(m.into()),
+            _ => None,
+        }
+    }
+}
+
+impl Message {
+    // Macroable
+    pub fn update_state(self, state: &mut State) {
+        use Message::*;
+        match self {
+            Refresh => {}
+            Update(inner) => inner.update_state(state),
+            NewPlayer(inner) => inner.update_state(state),
+        }
+    }
+}
+
+trait StateUpdater<S> {
+    fn update_state(&self, state: &mut S) {}
+}
+
+#[derive(Clone)]
+struct Update {}
+
+impl StateUpdater<State> for Update {
+    fn update_state(&self, state: &mut State) {
+        println!("Updated state.");
+    }
+}
+
+// Macroable
+impl Into<Message> for Update {
+    fn into(self) -> Message {
+        Message::Update(self)
+    }
+}
+
+// Macroable
+impl TryFrom<Message> for Update {
+    type Error = ();
+
+    fn try_from(value: Message) -> Result<Self, Self::Error> {
+        match value {
+            Message::Update(out) => Ok(out),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NewPlayer {}
+
+impl StateUpdater<State> for NewPlayer {}
 
 fn main() {
     let _guard = init_tracing();
